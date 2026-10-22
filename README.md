@@ -1,5 +1,14 @@
 # lastro
 
+[![versão](https://img.shields.io/badge/vers%C3%A3o-0.1.0-blue)](https://github.com/vpfeltrim/lastro/blob/main/plugins/lastro/.claude-plugin/plugin.json)
+[![licença](https://img.shields.io/github/license/vpfeltrim/lastro?label=licen%C3%A7a)](LICENSE)
+[![Claude Code](https://img.shields.io/badge/Claude%20Code-plugin-D97757?logo=claude&logoColor=white)](https://code.claude.com/docs/en/plugins/overview)
+[![OKF](https://img.shields.io/badge/OKF-v0.2-4285F4?logo=googlecloud&logoColor=white)](https://github.com/GoogleCloudPlatform/open-knowledge-format)
+[![python](https://img.shields.io/badge/python-3.9%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![testes](https://img.shields.io/badge/testes-46%20controles%20negativos-brightgreen)](plugins/lastro/tests/test_lastro.py)
+[![idioma](https://img.shields.io/badge/idioma-pt--BR-009C3B)](#lastro)
+[![último commit](https://img.shields.io/github/last-commit/vpfeltrim/lastro?label=%C3%BAltimo%20commit)](https://github.com/vpfeltrim/lastro/commits/main)
+
 **Memória de projeto para o Claude Code: um bundle [OKF](https://github.com/GoogleCloudPlatform/open-knowledge-format) que se mantém vivo sozinho.**
 
 As ações, as análises, a configuração, as baselines e as decisões entram na memória **enquanto o
