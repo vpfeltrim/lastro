@@ -1,0 +1,15 @@
+{
+  "name": "lastro",
+  "version": "0.1.0",
+  "description": "Memória de projeto para o Claude Code: um bundle OKF v0.2 mantido vivo por hooks — perfil por projeto, lint, índices gerados, captura das ações que mudam o ambiente e um Stop que cobra a consolidação.",
+  "author": {
+    "name": "vitware"
+  },
+  "keywords": [
+    "memoria",
+    "okf",
+    "open-knowledge-format",
+    "hooks"
+  ],
+  "license": "Apache-2.0"
+}

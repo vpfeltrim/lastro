@@ -1,0 +1,1140 @@
+#!/usr/bin/env -S python3 -I
+"""lastro — memória de projeto em OKF v0.2 para o Claude Code (plugin lastro).
+
+O bundle segue o Open Knowledge Format v0.2 (GoogleCloudPlatform/open-knowledge-format,
+SPEC.md no commit ad30107). O que o OKF não modela vem do perfil do projeto
+(.claude/memoria.yaml), com campos de prefixo próprio (padrão `mem_`).
+
+Comandos de uso:
+  lastro lint [--arquivo ARQ] [--json]   confere o bundle contra a spec e o perfil
+  lastro indices                         regenera os index.md das pastas (gerados)
+  lastro log ROTULO TEXTO                acrescenta uma linha no log.md, sob a data de hoje
+  lastro log --rotacionar                move os meses anteriores para historico/AAAA-MM/log.md
+  lastro briefing                        o resumo que a sessão recebe ao iniciar
+  lastro pendentes                       ações capturadas e ainda não consolidadas
+  lastro consolidar [--nada MOTIVO]      fecha as ações pendentes (exige linha nova no log)
+  lastro contrair ARQ --motivo M [--executar]   remove um conceito, se ninguém depender dele
+  lastro verificar ARQ --por human:ID    carimbo de revisão humana (o agente é impedido)
+  lastro certificar CHAVE ROTULO -- CMD  roda CMD e registra o valor em certificados.tsv
+  lastro perfil                          resume tipos, campos e regras do perfil
+  lastro init                            monta a estrutura num projeto (não sobrescreve)
+
+Comandos de hook (chamados pelo hooks/hooks.json do plugin):
+  hook-inicio · hook-guarda · hook-guarda-bash · hook-formato · hook-captura · hook-fim
+
+Todo hook é inerte em projeto sem .claude/memoria.yaml, e nunca derruba a sessão por
+erro próprio: falha interna sai com 0 e um aviso no stderr.
+"""
+import argparse
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+
+try:
+    import yaml
+except ImportError:  # o hook não pode derrubar a sessão por falta de dependência
+    yaml = None
+
+PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+RESERVADOS = {"index.md", "log.md"}
+STATUS_OKF = {"draft", "stable", "deprecated"}
+ATIVIDADE_STATUS = ["fazendo", "bloqueado", "backlog", "concluido", "cancelado"]
+ESCOPOS = {"leitura", "mudanca"}
+INSTANTE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})$")
+ATOR_RE = re.compile(r"^(human:[\w.-]+|process:[\w./-]+|[\w.-]+/[\w.\[\]-]+)$")
+NOME_RE = re.compile(r"^[a-z0-9][a-z0-9.-]*\.md$")
+DATA_RE = re.compile(r"^## (\d{4}-\d{2}-\d{2})\s*$")
+LINK_RE = re.compile(r"\]\(([^)\s]+)\)")
+FENCE_RE = re.compile(r"^```.*?^```", re.M | re.S)
+INLINE_RE = re.compile(r"`[^`\n]+`")
+
+# (padrão, substituição) — a mesma lista acusa segredo no bundle e mascara a captura.
+SEGREDOS = [
+    (re.compile(r"(?i)(authorization:\s*(?:basic|bearer|apikey)\s+)[A-Za-z0-9+/=._-]{12,}"), r"\1***"),
+    (re.compile(r"(?i)(\bApiKey\s+)[A-Za-z0-9+/=_-]{20,}"), r"\1***"),
+    (re.compile(r"(?i)((?:password|passwd|senha|secret|api[_-]?key|token)\s*[:=]\s*[\"']?)(?![$<~/*{(\[])(?=[^\s\"'`,;)]*\d)[^\s\"'`,;)]{6,}"), r"\1***"),
+    (re.compile(r"(\s-u\s+[\w.@-]+:)(?![$<])[^\s'\"]{3,}"), r"\1***"),
+    (re.compile(r"(https?://[^/\s:@]+:)(?![$<])[^/\s@]+(@)"), r"\1***\2"),
+    (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "AKIA***"),
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"), "-----BEGIN *** PRIVATE KEY-----"),
+]
+
+ROTULOS_PADRAO = ["Criação", "Atualização", "Descoberta", "Decisão", "Mudança no ambiente",
+                  "Resolução", "Conclusão", "Remoção", "Rotação"]
+
+PERFIL_PADRAO = {
+    "bundle": "knowledge",
+    "prefixo": "mem_",
+    "revisores": [],
+    "donos": [],
+    "campos_base": ["type", "title", "description", "dono"],
+    "tipos": {},
+    "estado": {"arquivo": "estado.md", "max_linhas": 60, "max_bytes": 8000},
+    "log": {"max_linha": 400, "rotulos": ROTULOS_PADRAO},
+    "captura": {"bash": [], "ignorar": [], "ferramentas": []},
+    "stop": {"exigir_commit": False},
+    "modulos": [],
+}
+
+
+# ── carga ──────────────────────────────────────────────────────────────────────
+
+class _Loader(getattr(yaml, "SafeLoader", object)):
+    """SafeLoader sem o resolvedor de timestamp: instante fica string, como no texto."""
+
+
+if yaml:
+    _Loader.yaml_implicit_resolvers = {
+        k: [r for r in v if r[0] != "tag:yaml.org,2002:timestamp"]
+        for k, v in yaml.SafeLoader.yaml_implicit_resolvers.items()
+    }
+
+
+def raiz_projeto():
+    env = os.environ.get("CLAUDE_PROJECT_DIR")
+    if env and (Path(env) / ".claude" / "memoria.yaml").is_file():
+        return Path(env)
+    p = Path.cwd().resolve()
+    for d in [p, *p.parents]:
+        if (d / ".claude" / "memoria.yaml").is_file():
+            return d
+    return None
+
+
+def carregar_perfil(root):
+    dados = yaml.load((root / ".claude" / "memoria.yaml").read_text(encoding="utf-8"), Loader=_Loader) or {}
+    perfil = json.loads(json.dumps(PERFIL_PADRAO))
+    for k, v in dados.items():
+        if isinstance(v, dict) and isinstance(perfil.get(k), dict):
+            perfil[k].update(v)
+        else:
+            perfil[k] = v
+    return perfil
+
+
+class Ctx:
+    def __init__(self, root):
+        self.root = root
+        self.perfil = carregar_perfil(root)
+        self.bundle = root / self.perfil["bundle"]
+        self.P = self.perfil["prefixo"]
+        self.estado_dir = root / ".claude" / "memoria"
+
+    def campo(self, nome):
+        return self.P + nome
+
+    def rel(self, path):
+        return Path(path).resolve().relative_to(self.bundle.resolve()).as_posix()
+
+    def no_bundle(self, path):
+        try:
+            self.rel(path)
+            return True
+        except ValueError:
+            return False
+
+    def pastas(self):
+        return {spec["pasta"]: nome for nome, spec in self.perfil["tipos"].items() if spec.get("pasta")}
+
+
+def ler_doc(path):
+    """Devolve (frontmatter|None, corpo, motivo_de_erro|None)."""
+    texto = Path(path).read_text(encoding="utf-8")
+    if not texto.startswith("---\n"):
+        return None, texto, "sem frontmatter YAML"
+    fim = texto.find("\n---", 3)
+    if fim == -1:
+        return None, texto, "frontmatter não fechado"
+    corpo = texto[fim + 4:].lstrip("\n")
+    try:
+        fm = yaml.load(texto[4:fim], Loader=_Loader)
+    except yaml.YAMLError as e:
+        return None, corpo, f"YAML inválido: {str(e).splitlines()[0]}"
+    if not isinstance(fm, dict):
+        return None, corpo, "frontmatter não é um mapa"
+    return fm, corpo, None
+
+
+def sem_codigo(texto):
+    return INLINE_RE.sub("", FENCE_RE.sub("", texto))
+
+
+def agora():
+    return datetime.now().astimezone()
+
+
+def instante_agora():
+    return agora().isoformat(timespec="seconds")
+
+
+def hoje():
+    return agora().date().isoformat()
+
+
+def parse_instante(v):
+    if not isinstance(v, str) or not INSTANTE_RE.match(v):
+        return None
+    try:
+        return datetime.fromisoformat(v.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def mascarar(texto):
+    for pat, sub in SEGREDOS:
+        texto = pat.sub(sub, texto)
+    return texto
+
+
+def tem_segredo(texto):
+    return [pat.pattern[:40] for pat, _ in SEGREDOS if pat.search(texto)]
+
+
+def titulo_de(fm, corpo, path):
+    if fm and isinstance(fm.get("title"), str) and fm["title"].strip():
+        return fm["title"].strip()
+    for linha in corpo.splitlines():
+        if linha.startswith("# "):
+            return linha[2:].strip()
+    return Path(path).stem
+
+
+def conceitos(ctx):
+    """Todo .md do bundle que não é reservado, fora de diretórios ocultos."""
+    out = []
+    for p in sorted(ctx.bundle.rglob("*.md")):
+        partes = p.relative_to(ctx.bundle).parts
+        if any(x.startswith(".") for x in partes) or p.name in RESERVADOS:
+            continue
+        out.append(p)
+    return out
+
+
+def resolver_link(ctx, origem, alvo):
+    alvo = alvo.split("#", 1)[0]
+    if not alvo or re.match(r"^[a-z][a-z0-9+.-]*:", alvo):
+        return None
+    if alvo.startswith("/"):
+        return ctx.bundle / alvo.lstrip("/")
+    return (Path(origem).parent / alvo).resolve()
+
+
+def e_link(v):
+    return isinstance(v, str) and v.strip().endswith(".md") and " " not in v.strip()
+
+
+# ── índices gerados ───────────────────────────────────────────────────────────
+
+def _item(ctx, p):
+    fm, corpo, _ = ler_doc(p)
+    desc = " ".join(str((fm or {}).get("description", "")).split())
+    return f"* [{titulo_de(fm, corpo, p)}](/{ctx.rel(p)}) - {desc}".rstrip(" -")
+
+
+def gerar_indice(ctx, pasta):
+    tipo = ctx.pastas().get(pasta)
+    spec = ctx.perfil["tipos"].get(tipo, {}) if tipo else {}
+    titulo = spec.get("titulo", pasta.replace("-", " ").capitalize())
+    base = ctx.bundle / pasta
+    docs = [p for p in conceitos(ctx) if p.is_relative_to(base)]
+    if pasta == "historico":
+        logs = sorted(base.glob("*/log.md"), reverse=True)
+        linhas = [f"# {titulo}", ""] + [f"* [{l.parent.name}](/{ctx.rel(l)}) - log de {l.parent.name}" for l in logs]
+        return "\n".join(linhas).rstrip() + "\n"
+    meta = []
+    for p in docs:
+        fm, _, _ = ler_doc(p)
+        meta.append((p, fm or {}))
+    vigentes = [(p, fm) for p, fm in meta if fm.get("status") != "deprecated"]
+    substituidos = [(p, fm) for p, fm in meta if fm.get("status") == "deprecated"]
+    secoes = []
+    if tipo == "Atividade":
+        st = ctx.campo("status")
+        for s in ATIVIDADE_STATUS:
+            grupo = [p for p, fm in vigentes if fm.get(st) == s]
+            if grupo:
+                secoes.append((f"{titulo} — {s}", sorted(grupo, key=lambda x: x.name)))
+        resto = [p for p, fm in vigentes if fm.get(st) not in ATIVIDADE_STATUS]
+        if resto:
+            secoes.append((f"{titulo} — sem status", sorted(resto, key=lambda x: x.name)))
+    elif spec.get("nome_com_data"):
+        secoes.append((titulo, sorted([p for p, _ in vigentes], key=lambda x: x.name, reverse=True)))
+    else:
+        secoes.append((titulo, sorted([p for p, _ in vigentes], key=lambda x: _item(ctx, x).lower())))
+    if substituidos:
+        secoes.append((f"{titulo} — substituídos", sorted([p for p, _ in substituidos], key=lambda x: x.name)))
+    if not secoes or all(not g for _, g in secoes):
+        return f"# {titulo}\n"
+    linhas = []
+    for nome, grupo in secoes:
+        if not grupo:
+            continue
+        linhas += [f"# {nome}", ""] + [_item(ctx, p) for p in grupo] + [""]
+    return "\n".join(linhas).rstrip() + "\n"
+
+
+def indices_esperados(ctx):
+    out = {}
+    for pasta in ctx.pastas():
+        if (ctx.bundle / pasta).is_dir():
+            out[ctx.bundle / pasta / "index.md"] = gerar_indice(ctx, pasta)
+    if (ctx.bundle / "historico").is_dir():
+        out[ctx.bundle / "historico" / "index.md"] = gerar_indice(ctx, "historico")
+    return out
+
+
+def cmd_indices(ctx, _args=None, quieto=False):
+    mudou = []
+    for path, conteudo in indices_esperados(ctx).items():
+        atual = path.read_text(encoding="utf-8") if path.exists() else None
+        if atual != conteudo:
+            path.write_text(conteudo, encoding="utf-8")
+            mudou.append(ctx.rel(path))
+    if not quieto:
+        print("índices atualizados: " + ", ".join(mudou) if mudou else "índices já estavam em dia.")
+    return 0
+
+
+# ── lint ───────────────────────────────────────────────────────────────────────
+
+class Achados:
+    def __init__(self):
+        self.erros, self.avisos = [], []
+
+    def erro(self, arq, cod, msg):
+        self.erros.append((arq, cod, msg))
+
+    def aviso(self, arq, cod, msg):
+        self.avisos.append((arq, cod, msg))
+
+
+def _instantes(fm, P):
+    """(rótulo, valor) de todo campo de instante que a spec ou o perfil definem."""
+    g = fm.get("generated")
+    if isinstance(g, dict) and "at" in g:
+        yield "generated.at", g["at"]
+    v = fm.get("verified")
+    for i, e in enumerate(v if isinstance(v, list) else [v] if isinstance(v, dict) else []):
+        if isinstance(e, dict) and "at" in e:
+            yield f"verified[{i}].at", e["at"]
+    if "stale_after" in fm:
+        yield "stale_after", fm["stale_after"]
+    for i, s in enumerate(fm.get("sources") or [] if isinstance(fm.get("sources"), list) else []):
+        if isinstance(s, dict) and "last_modified" in s:
+            yield f"sources[{i}].last_modified", s["last_modified"]
+    for chave in ("usage_window", P + "janela"):
+        w = fm.get(chave)
+        if isinstance(w, dict):
+            for lado in ("from", "to", "de", "ate"):
+                if lado in w:
+                    yield f"{chave}.{lado}", w[lado]
+
+
+def _registro_certificados(ctx):
+    reg = {}
+    tsv = ctx.bundle / "certificados.tsv"
+    if tsv.exists():
+        for linha in tsv.read_text(encoding="utf-8").splitlines():
+            if linha.startswith("#") or not linha.strip():
+                continue
+            c = linha.split("\t")
+            if len(c) >= 3:
+                reg[(c[0], c[1])] = c[2]
+    return reg
+
+
+def conferir_conceito(ctx, p, A, todos_tipos):
+    rel = ctx.rel(p)
+    P = ctx.campo
+    perfil = ctx.perfil
+    fm, corpo, motivo = ler_doc(p)
+    if motivo:
+        A.erro(rel, "E-FM", motivo)
+        return
+    if not NOME_RE.match(p.name):
+        A.erro(rel, "E-NOME", "nome fora de kebab-case minúsculo sem acento (a-z, 0-9, '-', '.')")
+    t = fm.get("type")
+    if not isinstance(t, str) or not t.strip():
+        A.erro(rel, "E-TYPE", "'type' ausente ou vazio (único campo que a spec exige, §11)")
+        return
+    spec = perfil["tipos"].get(t)
+    if spec is None:
+        A.erro(rel, "E-TYPE", f"type '{t}' fora do perfil ({', '.join(perfil['tipos'])}) — tipo novo é mudança de perfil")
+        return
+    partes = Path(rel).parts
+    if spec.get("arquivo"):
+        if rel != spec["arquivo"]:
+            A.erro(rel, "E-PASTA", f"o tipo {t} mora só em {spec['arquivo']}")
+    elif len(partes) < 2 or partes[0] != spec.get("pasta"):
+        A.erro(rel, "E-PASTA", f"o tipo {t} mora em {spec.get('pasta')}/")
+    if spec.get("nome_com_data") and not re.match(r"^\d{4}-\d{2}-\d{2}-", p.name):
+        A.erro(rel, "E-NOME", f"{t} leva a data na frente do nome: AAAA-MM-DD-assunto.md")
+    for c in list(perfil["campos_base"]) + list(spec.get("exige", [])):
+        if c not in fm or fm[c] in (None, "", []):
+            A.erro(rel, "E-CAMPO", f"campo obrigatório ausente: {c}")
+    if perfil["donos"] and "dono" in fm and fm["dono"] not in perfil["donos"]:
+        A.erro(rel, "E-DONO", f"dono '{fm['dono']}' fora da lista do perfil ({', '.join(perfil['donos'])})")
+    if "status" in fm and fm["status"] not in STATUS_OKF:
+        A.erro(rel, "E-STATUS", f"status '{fm['status']}' — a spec só aceita draft | stable | deprecated")
+    if "tags" in fm and not isinstance(fm["tags"], list):
+        A.erro(rel, "E-TAGS", "tags é lista YAML, não texto")
+    srcs = fm.get("sources")
+    if srcs is not None:
+        if not isinstance(srcs, list) or not all(isinstance(s, dict) and s.get("resource") for s in srcs):
+            A.erro(rel, "E-SOURCES", "sources é lista de mapas, cada um com 'resource' (§5.1)")
+    for rot, v in _instantes(fm, ctx.P):
+        if parse_instante(v) is None:
+            A.erro(rel, "E-INSTANTE", f"{rot}: '{v}' não é instante ISO 8601 com fuso (ex.: 2026-10-22T14:00:00-03:00)")
+    g = fm.get("generated")
+    if g is not None:
+        if not isinstance(g, dict) or not isinstance(g.get("by"), str) or not ATOR_RE.match(g["by"]):
+            A.erro(rel, "E-ATOR", "generated.by é ator: <produtor>/<versão>, human:<id> ou process:<id> (§7)")
+    v = fm.get("verified")
+    if v is not None:
+        for e in (v if isinstance(v, list) else [v]):
+            by = e.get("by") if isinstance(e, dict) else None
+            if by not in perfil["revisores"]:
+                A.erro(rel, "E-VERIFIED", f"verified.by '{by}' fora dos revisores do perfil — carimbo é só humano")
+    sa = parse_instante(fm.get("stale_after"))
+    if sa and agora() >= sa:
+        A.aviso(rel, "A-STALE", f"stale_after vencido em {fm['stale_after']} — reconferir contra o ambiente antes de embasar mudança")
+    # campos do perfil (prefixo)
+    if t == "Atividade" or P("status") in fm:
+        st, esc = fm.get(P("status")), fm.get(P("escopo"))
+        if st not in ATIVIDADE_STATUS:
+            A.erro(rel, "E-MEMSTATUS", f"{P('status')} '{st}' — use {' | '.join(ATIVIDADE_STATUS)}")
+        if esc not in ESCOPOS:
+            A.erro(rel, "E-ESCOPO", f"{P('escopo')} '{esc}' — use leitura | mudanca (mudanca = altera o ambiente)")
+        aut = fm.get(P("autorizacao"))
+        if aut is not None and not e_link(aut):
+            A.erro(rel, "E-AUTORIZACAO", f"{P('autorizacao')} é link para uma Decisao, nunca texto")
+        elif esc == "mudanca" and st in ("fazendo", "concluido"):
+            alvo = resolver_link(ctx, p, aut) if aut else None
+            if not alvo or not alvo.exists():
+                A.erro(rel, "E-AUTORIZACAO", f"atividade de mudança em '{st}' sem {P('autorizacao')} apontando para Decisao existente")
+            elif todos_tipos.get(alvo.resolve()) != "Decisao":
+                A.erro(rel, "E-AUTORIZACAO", f"{P('autorizacao')} aponta para algo que não é Decisao")
+        if st == "bloqueado" and not fm.get(P("bloqueado_por")):
+            A.erro(rel, "E-CAMPO", f"atividade bloqueada sem {P('bloqueado_por')} (link ou texto)")
+    sub = fm.get(P("substituido_por"))
+    if sub is not None:
+        alvo = resolver_link(ctx, p, sub) if e_link(sub) else None
+        if not alvo or not alvo.exists():
+            A.erro(rel, "E-SUBST", f"{P('substituido_por')} tem de apontar para conceito existente")
+        if fm.get("status") != "deprecated":
+            A.erro(rel, "E-SUBST", f"quem tem {P('substituido_por')} é status: deprecated")
+    elif fm.get("status") == "deprecated":
+        A.aviso(rel, "A-SUBST", f"deprecated sem {P('substituido_por')} — diga quem vale agora, se houver")
+    jan = fm.get(P("janela"))
+    if jan is not None:
+        de, ate = parse_instante((jan or {}).get("de")), parse_instante((jan or {}).get("ate"))
+        if not de or not ate or de >= ate:
+            A.erro(rel, "E-JANELA", f"{P('janela')} é {{de, ate}}, dois instantes com de < ate")
+    if "certificados" in perfil["modulos"] and fm.get(P("certificados")) is not None:
+        reg = _registro_certificados(ctx)
+        for c in fm.get(P("certificados")) or []:
+            if not isinstance(c, dict):
+                A.erro(rel, "E-CERT", "cada certificado é {chave, rotulo, valor}")
+                continue
+            atual = reg.get((str(c.get("chave")), str(c.get("rotulo"))))
+            if atual is None:
+                A.erro(rel, "E-CERT", f"certificado {c.get('chave')}/{c.get('rotulo')} não emitido (lastro certificar)")
+            elif str(c.get("valor")) != atual:
+                A.erro(rel, "E-CERT", f"{c.get('chave')}/{c.get('rotulo')}: o documento diz {c.get('valor')}, o certificado mais recente diz {atual}")
+    conferir_links(ctx, p, fm, corpo, A)
+
+
+def conferir_links(ctx, p, fm, corpo, A):
+    rel = ctx.rel(p)
+    alvos = [m.group(1) for m in LINK_RE.finditer(sem_codigo(corpo))]
+    for c in ("autorizacao", "substituido_por", "bloqueado_por"):
+        v = (fm or {}).get(ctx.campo(c))
+        if e_link(v):
+            alvos.append(v)
+    for s in (fm or {}).get("sources") or []:
+        if isinstance(s, dict) and e_link(s.get("resource")) and str(s["resource"]).startswith("/"):
+            alvos.append(s["resource"])
+    for a in alvos:
+        destino = resolver_link(ctx, p, a)
+        if destino is not None and not destino.exists():
+            A.erro(rel, "E-LINK", f"link quebrado: {a}")
+
+
+def conferir_log(ctx, p, A):
+    rel = ctx.rel(p)
+    datas, antes_da_data = [], False
+    maxl = ctx.perfil["log"]["max_linha"]
+    for n, linha in enumerate(p.read_text(encoding="utf-8").splitlines(), 1):
+        if linha.startswith("---") and n == 1:
+            A.erro(rel, "E-LOG", "log.md não leva frontmatter")
+        if linha.startswith("## "):
+            m = DATA_RE.match(linha)
+            if not m:
+                A.erro(rel, "E-LOG", f"linha {n}: título de seção do log é data ISO (## AAAA-MM-DD)")
+                continue
+            datas.append(m.group(1))
+        elif linha.startswith("* ") and not datas:
+            antes_da_data = True
+        if len(linha) > maxl:
+            A.aviso(rel, "A-LOGLINHA", f"linha {n} com {len(linha)} caracteres (> {maxl}): o log é uma linha por fato; o detalhe vai no conceito")
+    if antes_da_data:
+        A.erro(rel, "E-LOG", "entrada antes do primeiro título de data")
+    if datas != sorted(datas, reverse=True) or len(set(datas)) != len(datas):
+        A.erro(rel, "E-LOG", "datas fora de ordem ou repetidas (mais recente primeiro, uma seção por dia)")
+
+
+def lint(ctx, apenas=None):
+    A = Achados()
+    if not ctx.bundle.is_dir():
+        A.erro(ctx.perfil["bundle"], "E-BUNDLE", "diretório do bundle não existe (lastro init)")
+        return A, 0
+    todos = conceitos(ctx)
+    tipos = {}
+    for p in todos:
+        fm, _, _ = ler_doc(p)
+        if fm:
+            tipos[p.resolve()] = fm.get("type")
+    alvo = Path(apenas).resolve() if apenas else None
+    for p in todos:
+        if alvo is None or p.resolve() == alvo:
+            conferir_conceito(ctx, p, A, tipos)
+    # reservados
+    raiz_index = ctx.bundle / "index.md"
+    for idx in ctx.bundle.rglob("index.md"):
+        if alvo is not None and idx.resolve() != alvo:
+            continue
+        rel = ctx.rel(idx)
+        fm, corpo, motivo = ler_doc(idx)
+        if idx == raiz_index:
+            if fm is not None and set(fm) - {"okf_version"}:
+                A.erro(rel, "E-INDEX", "o index.md da raiz só aceita okf_version no frontmatter (§8)")
+            texto = corpo
+        else:
+            if fm is not None:
+                A.erro(rel, "E-INDEX", "index.md de pasta não leva frontmatter (§8)")
+            texto = idx.read_text(encoding="utf-8")
+        conferir_links(ctx, idx, None, texto, A)
+    if alvo is None:
+        if not raiz_index.exists():
+            A.erro("index.md", "E-RAIZ", "falta o index.md da raiz do bundle")
+        else:
+            corpo = raiz_index.read_text(encoding="utf-8")
+            for pasta in ctx.pastas():
+                if (ctx.bundle / pasta).is_dir() and f"/{pasta}/index.md" not in corpo:
+                    A.erro("index.md", "E-RAIZ", f"o index.md da raiz não aponta para /{pasta}/index.md")
+        for path, esperado in indices_esperados(ctx).items():
+            atual = path.read_text(encoding="utf-8") if path.exists() else None
+            if atual != esperado:
+                A.erro(ctx.rel(path), "E-INDICE", "índice gerado desatualizado — rode `lastro indices`")
+        for p in ctx.bundle.rglob("*"):
+            partes = p.relative_to(ctx.bundle).parts
+            if len(partes) >= 2 and partes[0] == "historico" and p.is_file() and p.name not in RESERVADOS:
+                A.erro(ctx.rel(p), "E-PASTA", "historico/ guarda só log.md arquivado")
+            if (len(partes) > 2 and p.name == "index.md" and partes[0] != "historico"):
+                A.erro(ctx.rel(p), "E-INDEX", "índice só na raiz e na pasta do tipo; subpasta entra no índice da pasta")
+        est = ctx.perfil["estado"]
+        ep = ctx.bundle / est["arquivo"]
+        if ep.exists():
+            _, corpo, _ = ler_doc(ep)
+            nl, nb = len(corpo.splitlines()), len(corpo.encode("utf-8"))
+            if nl > est["max_linhas"] or nb > est["max_bytes"]:
+                A.erro(est["arquivo"], "E-ESTADO", f"corpo com {nl} linhas / {nb} bytes — teto {est['max_linhas']} / {est['max_bytes']}: detalhe vai para o conceito, histórico para o log")
+    for lp in ctx.bundle.rglob("log.md"):
+        if alvo is None or lp.resolve() == alvo:
+            conferir_log(ctx, lp, A)
+    for f in ctx.bundle.rglob("*"):
+        if f.is_file() and f.suffix in (".md", ".tsv", ".yaml", ".yml", ".json", ".txt") and (alvo is None or f.resolve() == alvo):
+            if tem_segredo(f.read_text(encoding="utf-8", errors="replace")):
+                A.erro(ctx.rel(f), "E-SEGREDO", "parece conter credencial — o bundle vai para o git; referencie a variável ou o arquivo .env")
+    return A, len(todos)
+
+
+def cmd_lint(ctx, args):
+    A, n = lint(ctx, args.arquivo)
+    if args.json:
+        print(json.dumps({"conceitos": n, "erros": A.erros, "avisos": A.avisos}, ensure_ascii=False))
+    else:
+        for arq, cod, msg in A.erros:
+            print(f"ERRO   {arq}: {msg} [{cod}]")
+        for arq, cod, msg in A.avisos:
+            print(f"AVISO  {arq}: {msg} [{cod}]")
+        print(f"\n{n} conceitos — {len(A.erros)} erro(s), {len(A.avisos)} aviso(s)")
+    return 1 if A.erros else 0
+
+
+# ── log ────────────────────────────────────────────────────────────────────────
+
+def _secoes_log(texto):
+    """(cabeçalho, {data: [linhas]}, ordem)."""
+    cab, secoes, atual = [], {}, None
+    for linha in texto.splitlines():
+        m = DATA_RE.match(linha)
+        if m:
+            atual = m.group(1)
+            secoes.setdefault(atual, [])
+        elif atual is None:
+            cab.append(linha)
+        else:
+            secoes[atual].append(linha)
+    return cab, secoes
+
+
+def _montar_log(cab, secoes):
+    out = "\n".join(cab).rstrip() + "\n"
+    for d in sorted(secoes, reverse=True):
+        corpo = "\n".join(secoes[d]).strip("\n")
+        out += f"\n## {d}\n{corpo}\n"
+    return out
+
+
+def cmd_log(ctx, args):
+    lp = ctx.bundle / "log.md"
+    texto = lp.read_text(encoding="utf-8") if lp.exists() else "# Log do projeto\n"
+    cab, secoes = _secoes_log(texto)
+    if args.rotacionar:
+        mes = hoje()[:7]
+        velhos = {d: l for d, l in secoes.items() if d[:7] < mes}
+        if not velhos:
+            print("nada a rotacionar: o log só tem o mês corrente.")
+            return 0
+        por_mes = {}
+        for d, l in velhos.items():
+            por_mes.setdefault(d[:7], {})[d] = l
+        for m, secs in por_mes.items():
+            destino = ctx.bundle / "historico" / m / "log.md"
+            destino.parent.mkdir(parents=True, exist_ok=True)
+            c2, s2 = _secoes_log(destino.read_text(encoding="utf-8")) if destino.exists() else ([f"# Log de {m}"], {})
+            s2.update(secs)
+            destino.write_text(_montar_log(c2, s2), encoding="utf-8")
+            for d in secs:
+                del secoes[d]
+        lp.write_text(_montar_log(cab, secoes), encoding="utf-8")
+        cmd_indices(ctx, quieto=True)
+        _log_linha(ctx, "Rotação", f"meses {', '.join(sorted(por_mes))} movidos para [historico](/historico/index.md)")
+        print(f"rotacionado: {', '.join(sorted(por_mes))} → historico/")
+        return 0
+    if not args.rotulo or not args.texto:
+        print("uso: lastro log ROTULO TEXTO   (rótulos: " + ", ".join(ctx.perfil["log"]["rotulos"]) + ")", file=sys.stderr)
+        return 2
+    if args.rotulo not in ctx.perfil["log"]["rotulos"]:
+        print(f"rótulo '{args.rotulo}' fora do perfil: " + ", ".join(ctx.perfil["log"]["rotulos"]), file=sys.stderr)
+        return 2
+    _log_linha(ctx, args.rotulo, " ".join(args.texto))
+    print(f"log: **{args.rotulo}** registrado em {hoje()}.")
+    return 0
+
+
+def _log_linha(ctx, rotulo, texto):
+    lp = ctx.bundle / "log.md"
+    conteudo = lp.read_text(encoding="utf-8") if lp.exists() else "# Log do projeto\n"
+    cab, secoes = _secoes_log(conteudo)
+    secoes.setdefault(hoje(), [])
+    secoes[hoje()] = [f"* **{rotulo}**: {' '.join(texto.split())}"] + [l for l in secoes[hoje()] if l.strip()]
+    lp.write_text(_montar_log(cab, secoes), encoding="utf-8")
+
+
+# ── captura de ações e consolidação ───────────────────────────────────────────
+
+def _pendente(ctx):
+    return ctx.estado_dir / "pendente.jsonl"
+
+
+def ler_pendentes(ctx):
+    f = _pendente(ctx)
+    if not f.exists():
+        return []
+    out = []
+    for linha in f.read_text(encoding="utf-8").splitlines():
+        try:
+            out.append(json.loads(linha))
+        except json.JSONDecodeError:
+            continue
+    return out
+
+
+def capturavel(ctx, ferramenta, comando):
+    cap = ctx.perfil["captura"]
+    if ferramenta == "Bash":
+        alvo, pats = comando, cap.get("bash") or []
+    else:
+        alvo, pats = ferramenta, cap.get("ferramentas") or []
+    if not any(re.search(p, alvo, re.I | re.S) for p in pats):
+        return False
+    return not any(re.search(p, comando, re.I | re.S) for p in cap.get("ignorar") or [])
+
+
+def hook_captura(ctx, ev):
+    ferramenta = ev.get("tool_name", "")
+    ti = ev.get("tool_input") or {}
+    comando = ti.get("command", "") if ferramenta == "Bash" else json.dumps(ti, ensure_ascii=False)
+    if not comando or not capturavel(ctx, ferramenta, comando):
+        return 0
+    falhou = ev.get("hook_event_name") == "PostToolUseFailure"
+    resp = ev.get("tool_response")
+    if isinstance(resp, dict) and resp.get("interrupted"):
+        falhou = True
+    reg = {
+        "ts": agora().isoformat(timespec="milliseconds"),
+        "sessao": str(ev.get("session_id", "-"))[:8],
+        "ferramenta": ferramenta,
+        "descricao": mascarar(str(ti.get("description", "")))[:200],
+        "comando": mascarar(comando)[:600],
+        "ok": not falhou,
+    }
+    ctx.estado_dir.mkdir(parents=True, exist_ok=True)
+    with open(_pendente(ctx), "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(reg, ensure_ascii=False) + "\n")
+    return 0
+
+
+def _resumo_acao(r):
+    marca = "" if r.get("ok", True) else " (FALHOU)"
+    o_que = r.get("descricao") or r.get("comando", "")
+    return f"{r.get('ts', '')[:16]} · {o_que[:140]}{marca}"
+
+
+def cmd_pendentes(ctx, _args):
+    p = ler_pendentes(ctx)
+    if not p:
+        print("nenhuma ação pendente de consolidação.")
+        return 0
+    for r in p:
+        print("- " + _resumo_acao(r) + ("\n    $ " + r["comando"][:300] if r.get("descricao") else ""))
+    print(f"\n{len(p)} ação(ões) pendente(s).")
+    return 0
+
+
+def cmd_consolidar(ctx, args):
+    p = ler_pendentes(ctx)
+    if not p:
+        print("nada a consolidar.")
+        return 0
+    if not args.nada:
+        lp = ctx.bundle / "log.md"
+        primeira = min(parse_instante(r["ts"]) or agora() for r in p)
+        if not lp.exists() or datetime.fromtimestamp(lp.stat().st_mtime).astimezone() < primeira:
+            print("recusado: o log.md não mudou desde a primeira ação pendente. Registre o fato "
+                  "(lastro log ...) e o conceito afetado; ou, se nada merece memória, "
+                  "lastro consolidar --nada \"<motivo>\".", file=sys.stderr)
+            return 1
+    diario = ctx.estado_dir / "diario" / f"{hoje()[:7]}.jsonl"
+    diario.parent.mkdir(parents=True, exist_ok=True)
+    with open(diario, "a", encoding="utf-8") as fh:
+        for r in p:
+            r["consolidado"] = instante_agora()
+            if args.nada:
+                r["sem_registro"] = args.nada
+            fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+    _pendente(ctx).unlink()
+    print(f"{len(p)} ação(ões) consolidada(s)" + (f" sem registro: {args.nada}" if args.nada else "") + f" — diário em {diario.relative_to(ctx.root)}.")
+    return 0
+
+
+# ── briefing (SessionStart) ───────────────────────────────────────────────────
+
+def briefing(ctx, limite=8000):
+    A, n = lint(ctx)
+    L = [f"== memória do projeto (lastro) — bundle {ctx.perfil['bundle']}/ =="]
+    L.append(f"{n} conceitos · lint: {len(A.erros)} erro(s), {len(A.avisos)} aviso(s)"
+             + (" — rode `lastro lint`" if A.erros else ""))
+    pend = ler_pendentes(ctx)
+    if pend:
+        L.append(f"⚠ {len(pend)} ação(ões) que mudam o ambiente foram capturadas e ainda não estão na memória:")
+        L += ["  - " + _resumo_acao(r) for r in pend[-10:]]
+    st = ctx.campo("status")
+    ativas = []
+    for p in conceitos(ctx):
+        fm, corpo, _ = ler_doc(p)
+        if fm and fm.get("type") == "Atividade" and fm.get(st) in ("fazendo", "bloqueado"):
+            extra = f" — bloqueado por: {fm.get(ctx.campo('bloqueado_por'))}" if fm.get(st) == "bloqueado" else ""
+            ativas.append(f"  - [{fm.get(st)}] {titulo_de(fm, corpo, p)} (/{ctx.rel(p)}){extra}")
+    if ativas:
+        L.append("Atividades em andamento:")
+        L += ativas
+    vencidos = [f"  - {a}" for a, c, _ in A.avisos if c == "A-STALE"]
+    if vencidos:
+        L.append(f"Conceitos com stale_after vencido ({len(vencidos)}) — servem para investigar, não para embasar mudança:")
+        L += vencidos[:10]
+    lp = ctx.bundle / "log.md"
+    if lp.exists():
+        _, secoes = _secoes_log(lp.read_text(encoding="utf-8"))
+        ult = []
+        for d in sorted(secoes, reverse=True):
+            ult += [f"  {d} {l[2:]}" for l in secoes[d] if l.startswith("* ")]
+        if ult:
+            L.append("Últimas entradas do log:")
+            L += [x[:300] for x in ult[:8]]
+    try:
+        sujo = subprocess.run(["git", "status", "--porcelain", "-uall", "--", ctx.perfil["bundle"]], cwd=ctx.root,
+                              capture_output=True, text=True, timeout=5).stdout.strip()
+        if sujo:
+            L.append(f"git: {len(sujo.splitlines())} arquivo(s) do bundle sem commit.")
+    except Exception:
+        pass
+    L.append(f"O estado curado está em {ctx.perfil['bundle']}/{ctx.perfil['estado']['arquivo']} e o mapa em "
+             f"{ctx.perfil['bundle']}/index.md. Gravar na memória: skill lastro:memoria.")
+    texto = "\n".join(L)
+    return texto if len(texto) <= limite else texto[:limite - 40] + "\n… (cortado; lastro briefing)"
+
+
+# ── hooks ──────────────────────────────────────────────────────────────────────
+
+def _negar(motivo):
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                                             "permissionDecision": "deny",
+                                             "permissionDecisionReason": motivo}}, ensure_ascii=False))
+    return 0
+
+
+def _conteudo_novo(ev, path):
+    ti = ev.get("tool_input") or {}
+    if ev.get("tool_name") == "Write":
+        return ti.get("content", "")
+    atual = path.read_text(encoding="utf-8") if path.exists() else ""
+    edicoes = ti.get("edits") if ev.get("tool_name") == "MultiEdit" else [ti]
+    for e in edicoes or []:
+        velho, novo = e.get("old_string", ""), e.get("new_string", "")
+        atual = atual.replace(velho, novo) if e.get("replace_all") else atual.replace(velho, novo, 1)
+    return atual
+
+
+def _verified_de(texto):
+    if not texto.startswith("---\n"):
+        return None
+    fim = texto.find("\n---", 3)
+    try:
+        fm = yaml.load(texto[4:fim], Loader=_Loader) if fim != -1 else None
+    except yaml.YAMLError:
+        return None
+    v = fm.get("verified") if isinstance(fm, dict) else None
+    return json.dumps(v if isinstance(v, list) or v is None else [v], sort_keys=True)
+
+
+def hook_guarda(ctx, ev):
+    f = (ev.get("tool_input") or {}).get("file_path")
+    if not f or not ctx.no_bundle(f):
+        return 0
+    path = Path(f)
+    if path.resolve() in {p.resolve() for p in indices_esperados(ctx)}:
+        return _negar(f"lastro: {ctx.rel(path)} é gerado a partir das description — não se edita; rode `lastro indices`.")
+    novo = _conteudo_novo(ev, path)
+    if path.suffix == ".md":
+        antes = path.read_text(encoding="utf-8") if path.exists() else ""
+        if _verified_de(novo) != _verified_de(antes) and _verified_de(novo) not in (None, "null"):
+            return _negar("lastro: o carimbo `verified` é do revisor humano. Ele o aplica no terminal com "
+                          "`lastro verificar <arquivo> --por human:<id>`; o agente não escreve nem altera esse campo.")
+    s = tem_segredo(novo)
+    if s:
+        return _negar("lastro: o conteúdo parece trazer credencial e o bundle vai para o git. "
+                      "Referencie a variável de ambiente ou o arquivo .env em vez do valor.")
+    return 0
+
+
+def hook_guarda_bash(ctx, ev):
+    cmd = (ev.get("tool_input") or {}).get("command", "")
+    if re.search(r"\blastro\b[^|;&]*\bverificar\b", cmd):
+        return _negar("lastro: `lastro verificar` é o carimbo do revisor humano — só ele o roda, no terminal.")
+    return 0
+
+
+def hook_formato(ctx, ev):
+    f = (ev.get("tool_input") or {}).get("file_path")
+    if not f or not ctx.no_bundle(f) or not f.endswith(".md"):
+        return 0
+    path = Path(f)
+    if not path.exists():
+        return 0
+    A, _ = lint(ctx, apenas=path)
+    if A.erros:
+        msg = "\n".join(f"{a}: {m} [{c}]" for a, c, m in A.erros[:15])
+        print(json.dumps({"decision": "block", "reason": "lastro — o arquivo saiu fora do formato do bundle; "
+                          "conserte agora (o fim do turno também confere):\n" + msg}, ensure_ascii=False))
+        return 0
+    cmd_indices(ctx, quieto=True)
+    return 0
+
+
+def hook_fim(ctx, ev):
+    if ev.get("stop_hook_active"):
+        return 0
+    motivos = []
+    pend = ler_pendentes(ctx)
+    if pend:
+        motivos.append(f"Há {len(pend)} ação(ões) que mudam o ambiente, capturada(s) nesta sessão e ainda não consolidada(s) na memória:\n"
+                       + "\n".join("  - " + _resumo_acao(r) for r in pend[-10:])
+                       + "\nRegistre o que foi feito com a skill lastro:memoria (conceito afetado + `lastro log`) e rode "
+                         "`lastro consolidar`. Se nada disso merece memória, `lastro consolidar --nada \"<motivo>\"`.")
+    A, _ = lint(ctx)
+    if A.erros:
+        motivos.append(f"O bundle tem {len(A.erros)} erro(s) de formato (`lastro lint`):\n"
+                       + "\n".join(f"  - {a}: {m} [{c}]" for a, c, m in A.erros[:12]))
+    if ctx.perfil["stop"].get("exigir_commit"):
+        try:
+            sujo = subprocess.run(["git", "status", "--porcelain", "-uall", "--", ctx.perfil["bundle"]], cwd=ctx.root,
+                                  capture_output=True, text=True, timeout=5).stdout.strip()
+            if sujo:
+                motivos.append("O bundle tem mudança sem commit:\n" + sujo[:800])
+        except Exception:
+            pass
+    if motivos:
+        print(json.dumps({"decision": "block", "reason": "lastro — antes de encerrar o turno:\n\n" + "\n\n".join(motivos)},
+                         ensure_ascii=False))
+    return 0
+
+
+# ── contração, verificação, certificados ──────────────────────────────────────
+
+def quem_aponta(ctx, alvo):
+    alvo = alvo.resolve()
+    deps = []
+    for p in conceitos(ctx):
+        if p.resolve() == alvo:
+            continue
+        fm, corpo, _ = ler_doc(p)
+        links = [m.group(1) for m in LINK_RE.finditer(sem_codigo(corpo))]
+        links += [v for c in ("autorizacao", "substituido_por", "bloqueado_por")
+                  if e_link(v := (fm or {}).get(ctx.campo(c)))]
+        if any((d := resolver_link(ctx, p, l)) is not None and d.resolve() == alvo for l in links):
+            deps.append(ctx.rel(p))
+    idx = ctx.bundle / "index.md"
+    if idx.exists() and any((d := resolver_link(ctx, idx, m.group(1))) is not None and d.resolve() == alvo
+                            for m in LINK_RE.finditer(idx.read_text(encoding="utf-8"))):
+        deps.append("index.md")
+    return deps
+
+
+def cmd_contrair(ctx, args):
+    alvo = Path(args.arquivo)
+    if not alvo.is_absolute():
+        alvo = (ctx.bundle / args.arquivo) if not alvo.exists() else alvo.resolve()
+    if not alvo.exists() or not ctx.no_bundle(alvo) or alvo.name in RESERVADOS:
+        print(f"recusado: {args.arquivo} não é conceito do bundle.", file=sys.stderr)
+        return 1
+    deps = quem_aponta(ctx, alvo)
+    rel = ctx.rel(alvo)
+    if deps:
+        print(f"recusado: {len(deps)} documento(s) dependem de {rel} — reaponte ou reescreva antes:")
+        for d in deps:
+            print(f"  - {d}")
+        return 1
+    if not args.executar:
+        print(f"{rel}: ninguém depende. Para remover: lastro contrair {rel} --motivo \"...\" --executar")
+        return 0
+    if not args.motivo:
+        print("recusado: a remoção leva --motivo (vai para o log).", file=sys.stderr)
+        return 1
+    fm, corpo, _ = ler_doc(alvo)
+    titulo = titulo_de(fm, corpo, alvo)
+    r = subprocess.run(["git", "rm", "-q", "--", str(alvo)], cwd=ctx.root, capture_output=True, text=True)
+    if r.returncode != 0:
+        alvo.unlink()
+    cmd_indices(ctx, quieto=True)
+    _log_linha(ctx, "Remoção", f"{titulo} (`{rel}`) — {args.motivo}")
+    print(f"removido: {rel}; índices regenerados; motivo no log.")
+    return 0
+
+
+def cmd_verificar(ctx, args):
+    if args.por not in ctx.perfil["revisores"]:
+        print(f"recusado: '{args.por}' não é revisor do perfil ({', '.join(ctx.perfil['revisores'])}).", file=sys.stderr)
+        return 1
+    path = Path(args.arquivo).resolve() if Path(args.arquivo).exists() else ctx.bundle / args.arquivo
+    texto = path.read_text(encoding="utf-8")
+    fm, _, motivo = ler_doc(path)
+    if motivo:
+        print(f"recusado: {motivo}", file=sys.stderr)
+        return 1
+    fim = texto.find("\n---", 3)
+    bloco = texto[4:fim].splitlines()
+    v = fm.get("verified")
+    lista = (v if isinstance(v, list) else [v] if isinstance(v, dict) else [])
+    lista.append({"by": args.por, "at": instante_agora()})
+    novo, pular = [], False
+    for linha in bloco:
+        if re.match(r"^verified\s*:", linha):
+            pular = True
+            continue
+        if pular and (linha.startswith((" ", "-")) or not linha.strip()):
+            continue
+        pular = False
+        novo.append(linha)
+    novo += yaml.safe_dump({"verified": lista}, allow_unicode=True, sort_keys=False).rstrip().splitlines()
+    path.write_text("---\n" + "\n".join(novo) + texto[fim:], encoding="utf-8")
+    print(f"verificado: {ctx.rel(path)} por {args.por}.")
+    return 0
+
+
+def cmd_certificar(ctx, args):
+    if "certificados" not in ctx.perfil["modulos"]:
+        print("o módulo 'certificados' não está ligado no perfil (modulos: [certificados]).", file=sys.stderr)
+        return 1
+    comando = " ".join(args.comando).strip()
+    if not comando:
+        print("uso: lastro certificar CHAVE ROTULO -- COMANDO", file=sys.stderr)
+        return 2
+    if tem_segredo(comando):
+        print("recusado: o comando traz credencial literal; ele fica gravado no bundle. Use variável de ambiente.", file=sys.stderr)
+        return 1
+    t0 = time.time()
+    r = subprocess.run(comando, shell=True, cwd=ctx.root, capture_output=True, text=True)
+    custo = time.time() - t0
+    linhas = [l.strip() for l in r.stdout.splitlines() if l.strip()]
+    if r.returncode != 0 or not linhas:
+        print(f"recusado: o comando saiu com {r.returncode} ou não imprimiu valor.\n{r.stderr[-800:]}", file=sys.stderr)
+        return 1
+    valor = linhas[-1]
+    try:
+        commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=ctx.root, capture_output=True,
+                                text=True).stdout.strip() or "-"
+    except Exception:
+        commit = "-"
+    tsv = ctx.bundle / "certificados.tsv"
+    if not tsv.exists():
+        tsv.write_text("# chave\trotulo\tvalor\tcommit\temitido\tcusto_s\tcomando\n"
+                       "# SÓ ACRÉSCIMO. Emitido por `lastro certificar`; vale a linha mais recente de cada (chave, rotulo).\n",
+                       encoding="utf-8")
+    with open(tsv, "a", encoding="utf-8") as fh:
+        fh.write("\t".join([args.chave, args.rotulo, valor, commit, instante_agora(), f"{custo:.1f}",
+                            comando.replace("\t", " ")]) + "\n")
+    print(f"certificado {args.chave}/{args.rotulo} = {valor} ({custo:.1f}s)")
+    return 0
+
+
+# ── perfil e init ──────────────────────────────────────────────────────────────
+
+def cmd_perfil(ctx, _args):
+    pf = ctx.perfil
+    print(f"bundle: {pf['bundle']}/ · prefixo dos campos próprios: {ctx.P} · OKF {pf.get('okf_version', '0.2')}")
+    print(f"campos em todo conceito: {', '.join(pf['campos_base'])}")
+    print(f"donos: {', '.join(pf['donos']) or '(livre)'} · revisores (verified): {', '.join(pf['revisores']) or '(nenhum)'}")
+    print("\ntipos:")
+    for nome, spec in pf["tipos"].items():
+        onde = spec.get("arquivo") or f"{spec.get('pasta')}/"
+        extra = f" · exige {', '.join(spec['exige'])}" if spec.get("exige") else ""
+        data = " · nome com data" if spec.get("nome_com_data") else ""
+        print(f"  {nome:<11} {onde:<14}{extra}{data}" + (f" — {spec['uso']}" if spec.get("uso") else ""))
+    print(f"\nAtividade: {ctx.campo('status')} ∈ {' | '.join(ATIVIDADE_STATUS)}; {ctx.campo('escopo')} ∈ leitura | mudanca; "
+          f"mudanca em fazendo/concluido exige {ctx.campo('autorizacao')} → Decisao; bloqueado exige {ctx.campo('bloqueado_por')}.")
+    print(f"Supersessão: status: deprecated + {ctx.campo('substituido_por')}: /pasta/novo.md (nunca apagar à mão: lastro contrair).")
+    print(f"Instantes: ISO 8601 com fuso. Teto do {pf['estado']['arquivo']}: {pf['estado']['max_linhas']} linhas / {pf['estado']['max_bytes']} bytes.")
+    print(f"Rótulos do log: {', '.join(pf['log']['rotulos'])}. Módulos: {', '.join(pf['modulos']) or 'nenhum'}.")
+    return 0
+
+
+def _render(nome, subs):
+    t = (PLUGIN_ROOT / "templates" / nome).read_text(encoding="utf-8")
+    for k, v in subs.items():
+        t = t.replace("{{" + k + "}}", v)
+    return t
+
+
+def cmd_init(_ctx, args):
+    root = Path(os.environ.get("CLAUDE_PROJECT_DIR") or Path.cwd()).resolve()
+    feito = []
+
+    def escrever(rel, conteudo):
+        p = root / rel
+        if p.exists():
+            return
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(conteudo, encoding="utf-8")
+        feito.append(rel)
+
+    escrever(".claude/memoria.yaml", _render("memoria.yaml", {}))
+    ctx = Ctx(root)
+    b = ctx.perfil["bundle"]
+    secoes = "\n".join(f"* [{s.get('titulo', p.capitalize())}](/{p}/index.md) - {s.get('uso', '')}".rstrip(" -")
+                       for n, s in ctx.perfil["tipos"].items() if (p := s.get("pasta")))
+    subs = {"BUNDLE": b, "SECOES": secoes, "HOJE": hoje(), "AGORA": instante_agora(),
+            "DONO": (ctx.perfil["donos"] or ["process:memoria"])[-1], "PROJETO": root.name,
+            "ESTADO": ctx.perfil["estado"]["arquivo"]}
+    for pasta in ctx.pastas():
+        (ctx.bundle / pasta).mkdir(parents=True, exist_ok=True)
+    escrever(f"{b}/index.md", _render("index.md", subs))
+    escrever(f"{b}/log.md", _render("log.md", subs))
+    escrever(f"{b}/{ctx.perfil['estado']['arquivo']}", _render("estado.md", subs))
+    escrever(".claude/rules/memoria.md", _render("regra-memoria.md", subs))
+    if not (root / "CLAUDE.md").exists():
+        escrever("CLAUDE.md", _render("CLAUDE.md", subs))
+    else:
+        print("CLAUDE.md já existe — acrescente o bloco de memória de templates/CLAUDE.md (o import do estado).")
+    gi = root / ".gitignore"
+    linhas = gi.read_text(encoding="utf-8").splitlines() if gi.exists() else []
+    novas = [l for l in (".claude/memoria/pendente.jsonl", ".claude/memoria/diario/", ".claude/settings.local.json") if l not in linhas]
+    if novas:
+        gi.write_text("\n".join(linhas + ["# lastro: captura bruta, local"] + novas) + "\n", encoding="utf-8")
+        feito.append(".gitignore")
+    cmd_indices(ctx, quieto=True)
+    print("criado: " + (", ".join(feito) if feito else "nada (tudo já existia)"))
+    return 0
+
+
+# ── entrada ────────────────────────────────────────────────────────────────────
+
+HOOKS = {"hook-inicio", "hook-guarda", "hook-guarda-bash", "hook-formato", "hook-captura", "hook-fim"}
+
+
+def main(argv):
+    if argv and argv[0] in HOOKS:
+        try:
+            raw = sys.stdin.read()
+            ev = json.loads(raw) if raw.strip() else {}
+            if yaml is None:
+                print("lastro: PyYAML ausente (pip install pyyaml) — hooks de memória inertes.", file=sys.stderr)
+                return 0
+            root = raiz_projeto()
+            if root is None:
+                return 0
+            ctx = Ctx(root)
+            if argv[0] == "hook-inicio":
+                print(briefing(ctx))
+                return 0
+            return {"hook-guarda": hook_guarda, "hook-guarda-bash": hook_guarda_bash, "hook-formato": hook_formato,
+                    "hook-captura": hook_captura, "hook-fim": hook_fim}[argv[0]](ctx, ev)
+        except Exception as e:  # hook nunca derruba a sessão
+            print(f"lastro: falha interna em {argv[0]}: {type(e).__name__}: {e}", file=sys.stderr)
+            return 0
+
+    ap = argparse.ArgumentParser(prog="lastro", description=__doc__.split("\n\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("lint"); s.add_argument("--arquivo"); s.add_argument("--json", action="store_true")
+    sub.add_parser("indices")
+    s = sub.add_parser("log"); s.add_argument("rotulo", nargs="?"); s.add_argument("texto", nargs="*")
+    s.add_argument("--rotacionar", action="store_true")
+    sub.add_parser("briefing")
+    sub.add_parser("pendentes")
+    s = sub.add_parser("consolidar"); s.add_argument("--nada", metavar="MOTIVO")
+    s = sub.add_parser("contrair"); s.add_argument("arquivo"); s.add_argument("--motivo"); s.add_argument("--executar", action="store_true")
+    s = sub.add_parser("verificar"); s.add_argument("arquivo"); s.add_argument("--por", required=True)
+    s = sub.add_parser("certificar"); s.add_argument("chave"); s.add_argument("rotulo"); s.add_argument("comando", nargs=argparse.REMAINDER)
+    sub.add_parser("perfil")
+    sub.add_parser("init")
+    args = ap.parse_args(argv)
+    if yaml is None:
+        print("erro: PyYAML não instalado (pip install pyyaml)", file=sys.stderr)
+        return 2
+    if args.cmd == "init":
+        return cmd_init(None, args)
+    root = raiz_projeto()
+    if root is None:
+        print("erro: nenhum .claude/memoria.yaml neste diretório nem acima (lastro init).", file=sys.stderr)
+        return 2
+    ctx = Ctx(root)
+    if args.cmd == "certificar" and args.comando and args.comando[0] == "--":
+        args.comando = args.comando[1:]
+    if args.cmd == "briefing":
+        print(briefing(ctx))
+        return 0
+    return {"lint": cmd_lint, "indices": cmd_indices, "log": cmd_log, "pendentes": cmd_pendentes,
+            "consolidar": cmd_consolidar, "contrair": cmd_contrair, "verificar": cmd_verificar,
+            "certificar": cmd_certificar, "perfil": cmd_perfil}[args.cmd](ctx, args)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

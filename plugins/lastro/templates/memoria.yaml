@@ -1,0 +1,41 @@
+# Perfil de memória do projeto — lido pelo lastro (plugin lastro) e pelos hooks.
+# O bundle segue o OKF v0.2 (SPEC.md de GoogleCloudPlatform/open-knowledge-format, commit ad30107).
+# Mudar tipo, campo ou regra aqui é mudança de formato: registre uma Decisao antes.
+okf_version: "0.2"
+okf_spec_commit: ad30107
+bundle: knowledge
+prefixo: mem_                       # campos que o OKF não define levam este prefixo
+
+revisores: [human:SEU_ID]           # únicos que podem carimbar `verified`
+donos: [human:SEU_ID, process:memoria]
+campos_base: [type, title, description, dono]
+
+tipos:
+  Atividade:  {pasta: atividades, titulo: Atividades, exige: [mem_status, mem_escopo], uso: "trabalho a fazer, fazendo ou feito — o estado mora no arquivo"}
+  Runbook:    {pasta: runbooks,   titulo: Runbooks,   uso: "como fazer algo, passo a passo, repetível"}
+  Resolucao:  {pasta: resolucoes, titulo: Resoluções, uso: "problema que aconteceu: sintoma, causa, solução"}
+  Analise:    {pasta: analises,   titulo: Análises,   exige: [sources], uso: "conclusão tirada de dados coletados"}
+  Componente: {pasta: ambiente,   titulo: Ambiente,   exige: [sources, stale_after], uso: "peça do ambiente e sua configuração vigente"}
+  Baseline:   {pasta: baselines,  titulo: Baselines,  exige: [sources, stale_after, mem_janela], uso: "métrica de referência medida numa janela"}
+  Decisao:    {pasta: decisoes,   titulo: Decisões,   nome_com_data: true, uso: "o que foi decidido ou autorizado, quando e por quê"}
+  Estado:     {arquivo: estado.md, uso: "onde o projeto está agora — curto, importado pelo CLAUDE.md"}
+
+estado: {arquivo: estado.md, max_linhas: 60, max_bytes: 8000}
+log:
+  max_linha: 400
+  rotulos: [Criação, Atualização, Descoberta, Decisão, Mudança no ambiente, Resolução, Conclusão, Remoção, Rotação]
+
+# Ações que mudam o ambiente: casadas pelo hook PostToolUse e cobradas no fim do turno.
+captura:
+  bash:
+    - '\bcurl\b.*(-X\s*|--request\s+)(PUT|POST|DELETE|PATCH)\b'
+    - '\b(systemctl|service)\s+\S*\s*(restart|stop|start|reload|enable|disable)\b'
+    - '\bkubectl\s+(apply|delete|patch|scale|rollout|edit|replace)\b'
+    - '\b(terraform|tofu)\s+(apply|destroy|import)\b'
+    - '\bhelm\s+(install|upgrade|uninstall|rollback)\b'
+    - '\bssh\b.*\b(sudo|systemctl|rm|mv|tee|chmod|chown|sed\s+-i)\b'
+  ignorar: []
+  ferramentas: []                   # regex de nome de ferramenta MCP que muda o ambiente
+
+stop: {exigir_commit: false}
+modulos: []                         # opcional: [certificados]

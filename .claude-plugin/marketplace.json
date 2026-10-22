@@ -1,0 +1,14 @@
+{
+  "name": "lastro",
+  "description": "lastro — memória de projeto em OKF v0.2 + harness do Claude Code",
+  "owner": {
+    "name": "vitware"
+  },
+  "plugins": [
+    {
+      "name": "lastro",
+      "source": "./plugins/lastro",
+      "description": "Bundle OKF v0.2 mantido vivo por hooks: lint, índices gerados, captura de ações e Stop que cobra a consolidação"
+    }
+  ]
+}
