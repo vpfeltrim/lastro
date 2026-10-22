@@ -29,7 +29,7 @@ memory e no que ela mesma abrir. Num projeto curto, isso basta. Num projeto long
 apodrece, e o sintoma é sempre o mesmo: **sessões que se contradizem, remedem o que já foi medido e
 não enxergam o projeto inteiro.**
 
-O lastro nasceu da medição desse problema em dois projetos reais trabalhados com o Claude Code: um
+O Lastro nasceu da medição desse problema em dois projetos reais trabalhados com o Claude Code: um
 de desenvolvimento de software, com cerca de 194 mil linhas, e um de operação de infraestrutura em
 produção.
 
@@ -58,9 +58,9 @@ O diagnóstico, em uma frase: **a memória era um registro cronológico só de a
 consolidado.** Guardava bem o que aconteceu e quase nada do que vale agora, que é justamente o que
 uma sessão nova precisa.
 
-## O que o lastro resolve
+## O que o Lastro resolve
 
-| problema medido | como o lastro trata |
+| problema medido | como o Lastro trata |
 |---|---|
 | não há "o que vale agora" | `estado.md` com teto de tamanho, importado pelo `CLAUDE.md`, que também chega aos subagentes |
 | a sessão não sabe o que existe | no início de cada sessão, um resumo gerado: atividades em andamento, ações pendentes, conceitos vencidos e as últimas linhas do log |
@@ -82,18 +82,18 @@ O **OKF** (Open Knowledge Format, especificação aberta do Google Cloud) define
 caminho do arquivo, e há campos para origem (`sources`), confiança (`generated`, `verified`) e ciclo
 de vida (`status`, `stale_after`). O OKF não modela estado de trabalho, autorização, supersessão,
 remoção nem dono, e não define processo nenhum. Como a spec obriga o consumidor a tolerar tipos e
-campos desconhecidos, o lastro estende o formato sem sair dele, com campos de prefixo próprio
+campos desconhecidos, o Lastro estende o formato sem sair dele, com campos de prefixo próprio
 (`mem_`).
 
 O **harness do Claude Code** separa duas naturezas de mecanismo:
 - **contexto** (`CLAUDE.md`, rules, skills): o modelo lê e *tenta* seguir;
 - **execução** (hooks): o harness roda, e o modelo não escolhe.
 
-O lastro coloca no lado da execução tudo o que não pode falhar.
+O Lastro coloca no lado da execução tudo o que não pode falhar.
 
 ![O OKF dá o vocabulário, o harness dá a execução](docs/img/02-arquitetura.png)
 
-Tudo no lastro mora numa de quatro camadas:
+Tudo no Lastro mora numa de quatro camadas:
 
 | camada | o que é | exemplos |
 |---|---|---|
@@ -107,7 +107,7 @@ vira hook.**
 
 ### Uma sessão
 
-![Uma sessão com o lastro](docs/img/03-uma-sessao.png)
+![Uma sessão com o Lastro](docs/img/03-uma-sessao.png)
 
 1. **Começar.** O hook `SessionStart` entrega o resumo do bundle, e o `CLAUDE.md` importa o
    `estado.md`. A sessão sabe onde o projeto está antes da primeira pergunta.
@@ -251,7 +251,7 @@ Tipos do perfil padrão. Cada projeto pode mudar, mas tipo novo é decisão, nã
 Base de todo conceito: `type`, `title`, `description`, `dono`. Todo instante (`generated.at`,
 `verified[].at`, `stale_after`, `mem_janela`) é ISO 8601 **com fuso**.
 
-| campo do lastro | regra |
+| campo do Lastro | regra |
 |---|---|
 | `mem_status` | `backlog`, `fazendo`, `bloqueado`, `concluido` ou `cancelado` |
 | `mem_escopo` | `leitura` ou `mudanca` (altera o ambiente) |
@@ -317,9 +317,9 @@ Os diagramas deste README são gerados por `python3 docs/diagramas/gerar.py` (pr
 - **Impedir o agente de rodar `lastro verificar` é melhor esforço**, como toda inspeção de comando
   Bash. O carimbo é evidente no git, não impossível de forjar.
 - **Contradição entre dois textos em prosa não é detectada.** A literatura mostra que isso é instável
-  até nos melhores modelos. A resposta do lastro é colocar o número que decide num certificado, onde
+  até nos melhores modelos. A resposta do Lastro é colocar o número que decide num certificado, onde
   duas afirmações se comparam por igualdade.
-- **A spec do OKF ainda está na versão 0.2** e já mudou sem trocar de número. O lastro fixa o commit
+- **A spec do OKF ainda está na versão 0.2** e já mudou sem trocar de número. O Lastro fixa o commit
   `ad30107` da `SPEC.md` como referência.
 
 ## De onde vêm as ideias

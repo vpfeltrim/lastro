@@ -150,7 +150,7 @@ def d1():
 def d2():
     s = Svg(1600, 990)
     titulo(s, "O OKF dá o vocabulário. O harness dá a execução.",
-           "O lastro junta os dois num bundle versionado no git do próprio projeto.")
+           "O Lastro junta os dois num bundle versionado no git do próprio projeto.")
     topo = [
         (60, "OKF v0.2 — o formato", "contexto", ["um conceito por arquivo .md", "type obrigatório; title, description",
                                                    "sources: de onde saiu", "generated · verified (human:)",
@@ -201,7 +201,7 @@ def d2():
 
 def d3():
     s = Svg(1600, 900)
-    titulo(s, "Uma sessão com o lastro", "O modelo trabalha normalmente; os hooks garantem que nada do que mudou fique fora da memória.")
+    titulo(s, "Uma sessão com o Lastro", "O modelo trabalha normalmente; os hooks garantem que nada do que mudou fique fora da memória.")
     faixas = [("Você e o modelo", "contexto", 190), ("Hooks do harness", "executado", 410), ("Bundle e captura", "gerado", 630)]
     for nome, c, y in faixas:
         s.rect(40, y - 20, 1520, 200, fill=COR[c][1], stroke="none", r=16, sw=0)
@@ -293,7 +293,7 @@ def d4():
 def d5():
     s = Svg(1600, 1000)
     titulo(s, "O ciclo de vida: do conceito e da atividade",
-           "O OKF dá status e prazo; o lastro acrescenta quem carimba, quem substitui, como se remove e o que autoriza.")
+           "O OKF dá status e prazo; o Lastro acrescenta quem carimba, quem substitui, como se remove e o que autoriza.")
     s.text(60, 160, "Conceito", size=22, weight="bold")
     s.box(60, 190, 250, 130, ["nasce", "generated · sources", "type na pasta certa"], cor="neutro")
     s.box(400, 190, 250, 130, ["vigente", "status: stable", "serve para investigar"], cor="contexto")
