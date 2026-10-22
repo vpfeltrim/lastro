@@ -1,4 +1,4 @@
-# lastro
+# Lastro
 
 [![versão](https://img.shields.io/badge/vers%C3%A3o-0.1.0-blue)](https://github.com/vpfeltrim/lastro/blob/main/plugins/lastro/.claude-plugin/plugin.json)
 [![licença](https://img.shields.io/github/license/vpfeltrim/lastro?label=licen%C3%A7a)](LICENSE)
