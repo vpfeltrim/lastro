@@ -1,11 +1,11 @@
 # Lastro
 
-[![versão](https://img.shields.io/badge/vers%C3%A3o-0.1.0-blue)](https://github.com/vpfeltrim/lastro/blob/main/plugins/lastro/.claude-plugin/plugin.json)
+[![versão](https://img.shields.io/badge/vers%C3%A3o-0.2.0-blue)](https://github.com/vpfeltrim/lastro/blob/main/plugins/lastro/.claude-plugin/plugin.json)
 [![licença](https://img.shields.io/github/license/vpfeltrim/lastro?label=licen%C3%A7a)](LICENSE)
 [![Claude Code](https://img.shields.io/badge/Claude%20Code-plugin-D97757?logo=claude&logoColor=white)](https://code.claude.com/docs/en/plugins/overview)
 [![OKF](https://img.shields.io/badge/OKF-v0.2-4285F4?logo=googlecloud&logoColor=white)](https://github.com/GoogleCloudPlatform/open-knowledge-format)
 [![python](https://img.shields.io/badge/python-3.9%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![testes](https://img.shields.io/badge/testes-46%20controles%20negativos-brightgreen)](plugins/lastro/tests/test_lastro.py)
+[![testes](https://img.shields.io/badge/testes-57%20controles%20negativos-brightgreen)](plugins/lastro/tests/test_lastro.py)
 [![idioma](https://img.shields.io/badge/idioma-pt--BR-009C3B)](#lastro)
 [![último commit](https://img.shields.io/github/last-commit/vpfeltrim/lastro?label=%C3%BAltimo%20commit)](https://github.com/vpfeltrim/lastro/commits/main)
 
@@ -72,6 +72,7 @@ uma sessão nova precisa.
 | a gravação depende de lembrar | um hook captura as ações que **mudam o ambiente**, e o turno não termina sem consolidá-las |
 | o formato deriva | `lastro lint`, com controles negativos, roda na hora da escrita e no fim de cada turno |
 | credencial vai parar no git | o lint e o hook recusam segredo no bundle; a captura mascara credenciais |
+| credencial vaza para o modelo | o agente não acessa os arquivos de credencial, e qualquer valor secreto que apareça numa saída é removido antes de o modelo ver |
 
 ## Como funciona
 
@@ -149,6 +150,44 @@ sessão.
 - **Autorização é um link.** Uma `Atividade` de escopo `mudanca` não chega a `fazendo` ou
   `concluido` sem `mem_autorizacao` apontando para uma `Decisao` existente.
 
+### Sigilo: credencial não chega ao modelo
+
+O perfil declara onde moram as credenciais do projeto (arquivos `KEY=VALOR`, fora do git):
+
+```yaml
+segredos:
+  arquivos: ['~/.meu-projeto/*.env']
+```
+
+A partir daí, há duas camadas:
+- **Prevenção (`PreToolUse`):** o agente não abre, não lê, não edita e não referencia esses arquivos,
+  nem as variáveis secretas que eles definem. Um comando com uma credencial escrita por extenso é
+  recusado. O acesso fica com o wrapper do projeto, que usa a chave sem imprimi-la.
+- **Contenção (`PostToolUse`, toda ferramenta):** se um valor secreto aparecer em qualquer saída, ele
+  vira `[SEGREDO REMOVIDO: arquivo:VARIAVEL]` antes de chegar ao modelo e antes de a sessão ser gravada
+  em disco. A comparação é com os **valores reais** dos arquivos, inclusive a forma decodificada de
+  uma API key do Elastic (`base64("id:chave")`), e não com padrões adivinhados.
+
+Cada redação fica num diário local, só com o rótulo, nunca com o valor. Isso nasceu de um incidente
+real: uma checagem escrita à mão (`${val:-…}`) imprimiu duas chaves de produção. Com as duas camadas, a
+mesma tentativa foi bloqueada ou redigida numa sessão real, nos três caminhos testados (`source`,
+`Read` e `cat` de um arquivo comum).
+
+Limite: a telemetria do Claude Code (OpenTelemetry, se ligada) registra a saída original, porque a
+troca vale para o modelo e para o registro da sessão.
+
+### Commit automático
+
+Com `git.commit_automatico: true` no perfil, o hook `Stop` commita no fim de cada turno, e envia ao
+remoto se `git.push: true`. O commit só acontece:
+- **com o lint limpo**: um bundle com erro não vai para o histórico;
+- **sobre a lista explícita `git.caminhos`**: dado bruto de coleta e arquivo solto não entram por acidente;
+- **sem credencial**: se um valor do cofre ou um padrão de segredo aparecer em qualquer arquivo que
+  entraria, nada é commitado e o usuário é avisado.
+
+O título vem da primeira linha nova do `log.md`; o corpo traz as demais linhas e a lista de arquivos.
+A opção vem desligada no template: cada projeto decide.
+
 ### O bundle
 
 ```
@@ -225,6 +264,14 @@ captura:
     - 'mcp__.*__.*(create|update|delete)'
 
 modulos: [certificados]                  # opcional
+
+segredos:
+  arquivos: ['~/.meu-projeto/*.env']     # credenciais: o agente não toca, e a saída é limpa
+
+git:
+  commit_automatico: true                # commit no fim de cada turno
+  push: true
+  caminhos: [knowledge, CLAUDE.md, .claude/memoria.yaml, .claude/settings.json, .claude/rules]
 ```
 
 Se o projeto já tem `CLAUDE.md`, acrescente o import do estado (`@knowledge/estado.md`) e o contrato
@@ -304,7 +351,7 @@ hook de edição, mas não escapa do lint no fim do turno.
 python3 -I -m unittest discover -s plugins/lastro/tests -v
 ```
 
-São 46 controles negativos: cada regra do lint e cada hook têm um caso que **deve reprovar** e um que
+São 57 controles negativos: cada regra do lint e cada hook têm um caso que **deve reprovar** e um que
 deve passar. Um gate que não falha na entrada ruim não protege nada.
 
 Os diagramas deste README são gerados por `python3 docs/diagramas/gerar.py` (precisa do

@@ -38,4 +38,16 @@ captura:
   ferramentas: []                   # regex de nome de ferramenta MCP que muda o ambiente
 
 stop: {exigir_commit: false}
+
+# Commit automático no fim de cada turno: só com o lint limpo, só destes caminhos, e recusado se
+# houver credencial. A mensagem vem das linhas novas do log.
+git:
+  commit_automatico: false
+  push: false
+  caminhos: [knowledge, CLAUDE.md, .claude/memoria.yaml, .claude/settings.json, .claude/rules]
+
+# Arquivos KEY=VALOR com credenciais (fora do git). O agente não os lê nem referencia, e qualquer
+# valor secreto deles que aparecer numa saída é removido antes de chegar ao modelo.
+segredos:
+  arquivos: []                      # ex.: ['~/.meu-projeto/*.env']
 modulos: []                         # opcional: [certificados]

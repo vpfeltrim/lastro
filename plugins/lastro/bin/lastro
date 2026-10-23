@@ -21,11 +21,14 @@ Comandos de uso:
 
 Comandos de hook (chamados pelo hooks/hooks.json do plugin):
   hook-inicio · hook-guarda · hook-guarda-bash · hook-formato · hook-captura · hook-fim
+  hook-sigilo-pre · hook-sigilo-pos   (credenciais nunca chegam ao modelo)
 
 Todo hook é inerte em projeto sem .claude/memoria.yaml, e nunca derruba a sessão por
 erro próprio: falha interna sai com 0 e um aviso no stderr.
 """
 import argparse
+import base64
+import glob
 import json
 import os
 import re
@@ -861,30 +864,230 @@ def hook_formato(ctx, ev):
 
 
 def hook_fim(ctx, ev):
-    if ev.get("stop_hook_active"):
-        return 0
-    motivos = []
-    pend = ler_pendentes(ctx)
-    if pend:
-        motivos.append(f"Há {len(pend)} ação(ões) que mudam o ambiente, capturada(s) nesta sessão e ainda não consolidada(s) na memória:\n"
-                       + "\n".join("  - " + _resumo_acao(r) for r in pend[-10:])
-                       + "\nRegistre o que foi feito com a skill lastro:memoria (conceito afetado + `lastro log`) e rode "
-                         "`lastro consolidar`. Se nada disso merece memória, `lastro consolidar --nada \"<motivo>\"`.")
     A, _ = lint(ctx)
-    if A.erros:
-        motivos.append(f"O bundle tem {len(A.erros)} erro(s) de formato (`lastro lint`):\n"
-                       + "\n".join(f"  - {a}: {m} [{c}]" for a, c, m in A.erros[:12]))
-    if ctx.perfil["stop"].get("exigir_commit"):
-        try:
-            sujo = subprocess.run(["git", "status", "--porcelain", "-uall", "--", ctx.perfil["bundle"]], cwd=ctx.root,
-                                  capture_output=True, text=True, timeout=5).stdout.strip()
-            if sujo:
-                motivos.append("O bundle tem mudança sem commit:\n" + sujo[:800])
-        except Exception:
-            pass
-    if motivos:
-        print(json.dumps({"decision": "block", "reason": "lastro — antes de encerrar o turno:\n\n" + "\n\n".join(motivos)},
-                         ensure_ascii=False))
+    auto = bool((ctx.perfil.get("git") or {}).get("commit_automatico"))
+    if not ev.get("stop_hook_active"):
+        motivos = []
+        pend = ler_pendentes(ctx)
+        if pend:
+            motivos.append(f"Há {len(pend)} ação(ões) que mudam o ambiente, capturada(s) nesta sessão e ainda não consolidada(s) na memória:\n"
+                           + "\n".join("  - " + _resumo_acao(r) for r in pend[-10:])
+                           + "\nRegistre o que foi feito com a skill lastro:memoria (conceito afetado + `lastro log`) e rode "
+                             "`lastro consolidar`. Se nada disso merece memória, `lastro consolidar --nada \"<motivo>\"`.")
+        if A.erros:
+            motivos.append(f"O bundle tem {len(A.erros)} erro(s) de formato (`lastro lint`):\n"
+                           + "\n".join(f"  - {a}: {m} [{c}]" for a, c, m in A.erros[:12]))
+        if ctx.perfil["stop"].get("exigir_commit") and not auto:
+            try:
+                sujo = subprocess.run(["git", "status", "--porcelain", "-uall", "--", ctx.perfil["bundle"]], cwd=ctx.root,
+                                      capture_output=True, text=True, timeout=5).stdout.strip()
+                if sujo:
+                    motivos.append("O bundle tem mudança sem commit:\n" + sujo[:800])
+            except Exception:
+                pass
+        if motivos:
+            print(json.dumps({"decision": "block", "reason": "lastro — antes de encerrar o turno:\n\n" + "\n\n".join(motivos)},
+                             ensure_ascii=False))
+            return 0
+    if auto and not A.erros:
+        aviso = commit_automatico(ctx)
+        if aviso:
+            print(json.dumps({"systemMessage": aviso}, ensure_ascii=False))
+    return 0
+
+
+# ── commit automático ──────────────────────────────────────────────────────────
+#
+# Ligado por `git.commit_automatico` no perfil. Roda no fim do turno, só com o lint limpo, e só sobre
+# `git.caminhos` (lista explícita: dado bruto ou arquivo solto não entram por acidente). Recusa o
+# commit inteiro se um valor de credencial do cofre (`segredos.arquivos`) ou um padrão de segredo
+# aparecer em qualquer arquivo que entraria. A mensagem sai das linhas novas do log.
+
+def _git(ctx, *args, timeout=20):
+    return subprocess.run(["git", *args], cwd=ctx.root, capture_output=True, text=True, timeout=timeout)
+
+
+def commit_automatico(ctx):
+    """None quando deu certo ou não havia nada; texto do problema caso contrário."""
+    cfg = ctx.perfil.get("git") or {}
+    caminhos = [c for c in (cfg.get("caminhos") or [ctx.perfil["bundle"]]) if (ctx.root / c).exists()]
+    try:
+        if _git(ctx, "rev-parse", "--is-inside-work-tree").returncode != 0 or not caminhos:
+            return None
+        mudou = [l[3:].split(" -> ")[-1] for l in _git(ctx, "status", "--porcelain", "-uall", "--", *caminhos).stdout.splitlines()]
+        if not mudou:
+            return None
+        valores, _ = carregar_segredos(ctx)
+        for rel in mudou:
+            f = ctx.root / rel
+            if not f.is_file():
+                continue
+            texto = f.read_text(encoding="utf-8", errors="replace")
+            if any(v in texto for v in valores) or tem_segredo(texto):
+                return (f"lastro: commit automático RECUSADO — {rel} parece conter credencial. "
+                        "Nada foi commitado; remova o valor e o próximo fim de turno commita.")
+        _git(ctx, "add", "-A", "--", *caminhos)
+        novas = [l[1:].strip() for l in _git(ctx, "diff", "--cached", "-U0", "--", f"{ctx.perfil['bundle']}/log.md").stdout.splitlines()
+                 if l.startswith("+* ")]
+        limpo = lambda s: re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", s.lstrip("* ").replace("**", ""))
+        arquivos = _git(ctx, "diff", "--cached", "--name-only").stdout.split()
+        if not arquivos:
+            return None
+        titulo = ("memória: " + limpo(novas[0])) if novas else f"memória: {len(arquivos)} arquivo(s) atualizado(s)"
+        titulo = titulo if len(titulo) <= 72 else titulo[:71] + "…"
+        corpo = "\n".join(["Linhas novas do log:"] + [f"- {limpo(n)}" for n in novas] + [""] if novas else [])
+        corpo += "Arquivos:\n" + "\n".join(f"- {a}" for a in arquivos[:40])
+        r = _git(ctx, "commit", "-q", "-m", titulo, "-m", corpo,
+                 "-m", "Commit automático do lastro no fim do turno.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>")
+        if r.returncode != 0:
+            return f"lastro: commit automático falhou: {(r.stderr or r.stdout).strip()[:300]}"
+        if cfg.get("push"):
+            r = _git(ctx, "push", "-q", timeout=40)
+            if r.returncode != 0:
+                return f"lastro: commit feito, mas o push falhou: {(r.stderr or r.stdout).strip()[:300]}"
+    except subprocess.TimeoutExpired:
+        return "lastro: commit automático passou do tempo; rode `git status` para ver o estado."
+    return None
+
+
+# ── sigilo: credenciais não chegam ao modelo ──────────────────────────────────
+#
+# Duas camadas, ligadas por `segredos.arquivos` no perfil (globs de arquivos KEY=VALOR):
+#   prevenção (PreToolUse): o agente não lê, não abre e não referencia esses arquivos nem as variáveis
+#     secretas deles, e não escreve uma credencial por extenso num comando;
+#   contenção (PostToolUse): qualquer valor secreto que aparecer numa saída é trocado antes de o modelo
+#     ver. A comparação é com os VALORES reais (e a forma decodificada da API key do Elastic), não com
+#     padrões adivinhados.
+
+NOME_SENSIVEL = re.compile(r"(KEY|TOKEN|SECRET|PASS|PASSWD|PASSWORD|SENHA|CREDENTIAL|AUTH)", re.I)
+LINHA_ENV = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$")
+
+
+def _globs_segredo(ctx):
+    return [os.path.expanduser(g) for g in (ctx.perfil.get("segredos") or {}).get("arquivos", [])]
+
+
+def carregar_segredos(ctx):
+    """({valor: rótulo}, {nome de variável}) — rótulo é arquivo:VARIAVEL, nunca o valor."""
+    valores, nomes = {}, set()
+    for g in _globs_segredo(ctx):
+        for f in glob.glob(g):
+            try:
+                linhas = Path(f).read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                continue
+            for linha in linhas:
+                m = LINHA_ENV.match(linha)
+                if not m or not NOME_SENSIVEL.search(m.group(1)):
+                    continue
+                nome, v = m.group(1), m.group(2).strip("\"'")
+                if len(v) < 8:
+                    continue
+                nomes.add(nome)
+                rot = f"{Path(f).name}:{nome}"
+                valores[v] = rot
+                try:  # API key do Elastic: base64("id:chave") — o decodificado e a chave crua também
+                    dec = base64.b64decode(v, validate=True).decode("utf-8")
+                    if ":" in dec:
+                        valores[dec] = rot
+                        if len(dec.split(":", 1)[1]) >= 12:
+                            valores[dec.split(":", 1)[1]] = rot
+                except Exception:
+                    pass
+    return valores, nomes
+
+
+def agulhas_segredo(ctx):
+    """Trechos de caminho que identificam os arquivos de credencial (ex.: '.meu-projeto')."""
+    out = set()
+    for g in (ctx.perfil.get("segredos") or {}).get("arquivos", []):
+        literal = re.split(r"[*?\[]", g, 1)[0].rstrip("/")
+        nome = Path(literal).name
+        if nome and nome not in ("~", "."):
+            out.add(nome)
+    return out
+
+
+def _caminho_e_segredo(ctx, caminho):
+    if not caminho:
+        return False
+    absoluto = os.path.abspath(os.path.expanduser(str(caminho)))
+    for g in _globs_segredo(ctx):
+        base = re.split(r"[*?\[]", g, 1)[0]
+        if absoluto in glob.glob(g) or (base.endswith("/") and absoluto.startswith(base.rstrip("/"))):
+            return True
+    return any(a in str(caminho) for a in agulhas_segredo(ctx))
+
+
+def hook_sigilo_pre(ctx, ev):
+    if not (ctx.perfil.get("segredos") or {}).get("arquivos"):
+        return 0
+    ti = ev.get("tool_input") or {}
+    ferramenta = ev.get("tool_name", "")
+    valores, nomes = carregar_segredos(ctx)
+    if ferramenta == "Bash":
+        cmd = ti.get("command", "")
+        if any(a in cmd for a in agulhas_segredo(ctx)):
+            return _negar("lastro (sigilo): o agente não acessa arquivos de credencial diretamente. Use o "
+                          "wrapper do projeto (por exemplo `bin/es <amb> conferir`), que usa a chave sem imprimi-la.")
+        if any(re.search(r"\$\{?" + re.escape(n) + r"\b", cmd) for n in nomes):
+            return _negar("lastro (sigilo): o comando referencia uma variável de credencial. Use o wrapper do projeto.")
+        if any(v in cmd for v in valores):
+            return _negar("lastro (sigilo): o comando traz uma credencial por extenso. Use o wrapper do projeto.")
+        return 0
+    alvos = [ti.get("file_path"), ti.get("notebook_path"), ti.get("path")]
+    if ferramenta in ("Grep", "Glob"):
+        alvos.append(ti.get("pattern") if ferramenta == "Glob" else None)
+    if any(_caminho_e_segredo(ctx, a) for a in alvos if a):
+        return _negar("lastro (sigilo): arquivo de credencial — o agente não lê nem edita. "
+                      "Quem mexe nele é o usuário, no terminal.")
+    texto = json.dumps(ti, ensure_ascii=False)
+    if any(v in texto for v in valores):
+        return _negar("lastro (sigilo): a entrada da ferramenta traz uma credencial por extenso.")
+    return 0
+
+
+def _redigir(obj, pares):
+    """Troca cada valor secreto em toda string da estrutura, preservando a forma."""
+    if isinstance(obj, str):
+        for v, rot in pares:
+            if v in obj:
+                obj = obj.replace(v, f"[SEGREDO REMOVIDO: {rot}]")
+        return obj
+    if isinstance(obj, list):
+        return [_redigir(x, pares) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _redigir(x, pares) for k, x in obj.items()}
+    return obj
+
+
+def hook_sigilo_pos(ctx, ev):
+    if not (ctx.perfil.get("segredos") or {}).get("arquivos"):
+        return 0
+    valores, _ = carregar_segredos(ctx)
+    if not valores:
+        return 0
+    resp = ev.get("tool_response")
+    pares = sorted(valores.items(), key=lambda kv: -len(kv[0]))  # o mais longo primeiro
+    novo = _redigir(resp, pares)
+    if novo == resp:
+        return 0
+    rotulos = sorted({rot for v, rot in pares if v in json.dumps(resp, ensure_ascii=False)})
+    try:
+        d = ctx.estado_dir / "diario"
+        d.mkdir(parents=True, exist_ok=True)
+        with open(d / "sigilo.jsonl", "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"ts": instante_agora(), "ferramenta": ev.get("tool_name"), "rotulos": rotulos},
+                                ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+    print(json.dumps({"hookSpecificOutput": {
+        "hookEventName": "PostToolUse",
+        "updatedToolOutput": novo,
+        "additionalContext": "lastro (sigilo): a saída desta ferramenta continha credencial ("
+                             + ", ".join(rotulos) + ") e o valor foi removido antes de chegar ao modelo. "
+                             "Não tente recuperá-lo; o comando que imprimiu a credencial precisa ser corrigido.",
+    }}, ensure_ascii=False))
     return 0
 
 
@@ -1077,7 +1280,8 @@ def cmd_init(_ctx, args):
 
 # ── entrada ────────────────────────────────────────────────────────────────────
 
-HOOKS = {"hook-inicio", "hook-guarda", "hook-guarda-bash", "hook-formato", "hook-captura", "hook-fim"}
+HOOKS = {"hook-inicio", "hook-guarda", "hook-guarda-bash", "hook-formato", "hook-captura", "hook-fim",
+         "hook-sigilo-pre", "hook-sigilo-pos"}
 
 
 def main(argv):
@@ -1096,7 +1300,8 @@ def main(argv):
                 print(briefing(ctx))
                 return 0
             return {"hook-guarda": hook_guarda, "hook-guarda-bash": hook_guarda_bash, "hook-formato": hook_formato,
-                    "hook-captura": hook_captura, "hook-fim": hook_fim}[argv[0]](ctx, ev)
+                    "hook-captura": hook_captura, "hook-fim": hook_fim,
+                    "hook-sigilo-pre": hook_sigilo_pre, "hook-sigilo-pos": hook_sigilo_pos}[argv[0]](ctx, ev)
         except Exception as e:  # hook nunca derruba a sessão
             print(f"lastro: falha interna em {argv[0]}: {type(e).__name__}: {e}", file=sys.stderr)
             return 0

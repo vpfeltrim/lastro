@@ -320,5 +320,148 @@ class TestHooks(Projeto):
             self.assertEqual((r.returncode, r.stdout.strip()), (0, ""))
 
 
+class TestSigilo(Projeto):
+    """A credencial nunca chega ao modelo: nem por acesso direto, nem por saída de ferramenta."""
+
+    def setUp(self):
+        super().setUp()
+        import base64
+        self.cofre = self.root / "cofre-teste"
+        self.cofre.mkdir()
+        self.decod = "idFalso123:segredoSuperSecreto987"
+        self.chave = base64.b64encode(self.decod.encode()).decode()
+        (self.cofre / "npr.env").write_text(f"ES_URL=https://exemplo.invalid\nES_API_KEY_LEITURA={self.chave}\n")
+        perfil = self.root / ".claude" / "memoria.yaml"
+        perfil.write_text(perfil.read_text().replace("arquivos: []", f"arquivos: ['{self.cofre}/*.env']"))
+
+    def pre(self, ferramenta, **ti):
+        r = self.hook("hook-sigilo-pre", {"hook_event_name": "PreToolUse", "tool_name": ferramenta, "tool_input": ti})
+        return json.loads(r.stdout)["hookSpecificOutput"]["permissionDecision"] if r.stdout.strip() else "permitido"
+
+    def pos(self, resposta, ferramenta="Bash"):
+        r = self.hook("hook-sigilo-pos", {"hook_event_name": "PostToolUse", "tool_name": ferramenta,
+                                          "tool_input": {}, "tool_response": resposta})
+        return json.loads(r.stdout)["hookSpecificOutput"] if r.stdout.strip() else None
+
+    def test_bash_no_arquivo_de_credencial_e_negado(self):
+        self.assertEqual(self.pre("Bash", command=f". {self.cofre}/npr.env; echo ok"), "deny")
+        self.assertEqual(self.pre("Bash", command="cat ~/cofre-teste/npr.env"), "deny")
+
+    def test_bash_com_variavel_secreta_e_negado(self):
+        self.assertEqual(self.pre("Bash", command='curl -H "Authorization: ApiKey $ES_API_KEY_LEITURA" x'), "deny")
+        self.assertEqual(self.pre("Bash", command='echo ${ES_API_KEY_LEITURA}'), "deny")
+
+    def test_bash_com_credencial_por_extenso_e_negado(self):
+        self.assertEqual(self.pre("Bash", command=f"curl -H 'Authorization: ApiKey {self.chave}' x"), "deny")
+
+    def test_bash_normal_passa(self):
+        self.assertEqual(self.pre("Bash", command="bin/es npr GET /_cluster/health"), "permitido")
+        self.assertEqual(self.pre("Bash", command="echo $ES_URL_QUALQUER; ls"), "permitido")
+
+    def test_read_grep_edit_no_cofre_sao_negados(self):
+        self.assertEqual(self.pre("Read", file_path=str(self.cofre / "npr.env")), "deny")
+        self.assertEqual(self.pre("Grep", pattern="KEY", path=str(self.cofre)), "deny")
+        self.assertEqual(self.pre("Edit", file_path=str(self.cofre / "npr.env"), old_string="a", new_string="b"), "deny")
+        self.assertEqual(self.pre("Read", file_path=str(self.root / "CLAUDE.md")), "permitido")
+
+    def test_saida_com_chave_e_redigida_preservando_a_forma(self):
+        resp = {"stdout": f"ES_API_KEY_LEITURA={self.chave}\nfim", "stderr": "", "interrupted": False, "isImage": False}
+        out = self.pos(resp)
+        novo = out["updatedToolOutput"]
+        self.assertEqual(set(novo), set(resp))
+        self.assertNotIn(self.chave, json.dumps(novo))
+        self.assertIn("[SEGREDO REMOVIDO: npr.env:ES_API_KEY_LEITURA]", novo["stdout"])
+        self.assertIn("fim", novo["stdout"])
+
+    def test_forma_decodificada_tambem_e_redigida(self):
+        segredo = self.decod.split(":", 1)[1]
+        out = self.pos({"stdout": f"id e chave: {self.decod} | so a chave: {segredo}", "stderr": "",
+                        "interrupted": False, "isImage": False})
+        self.assertNotIn(segredo, json.dumps(out["updatedToolOutput"]))
+
+    def test_estrutura_aninhada_de_outra_ferramenta(self):
+        out = self.pos({"file": {"content": f"x {self.chave} y", "numLines": 1}}, ferramenta="Read")
+        self.assertNotIn(self.chave, json.dumps(out["updatedToolOutput"]))
+        self.assertEqual(out["updatedToolOutput"]["file"]["numLines"], 1)
+
+    def test_saida_sem_segredo_nao_muda(self):
+        self.assertIsNone(self.pos({"stdout": "cluster yellow", "stderr": "", "interrupted": False, "isImage": False}))
+
+    def test_registro_de_auditoria_sem_o_valor(self):
+        self.pos({"stdout": self.chave, "stderr": "", "interrupted": False, "isImage": False})
+        log = (self.root / ".claude" / "memoria" / "diario" / "sigilo.jsonl").read_text()
+        self.assertIn("npr.env:ES_API_KEY_LEITURA", log)
+        self.assertNotIn(self.chave, log)
+
+    def test_inerte_sem_segredos_no_perfil(self):
+        perfil = self.root / ".claude" / "memoria.yaml"
+        perfil.write_text(perfil.read_text().replace(f"arquivos: ['{self.cofre}/*.env']", "arquivos: []"))
+        self.assertIsNone(self.pos({"stdout": self.chave, "stderr": "", "interrupted": False, "isImage": False}))
+
+
+class TestCommitAutomatico(Projeto):
+    def setUp(self):
+        super().setUp()
+        g = lambda *a, cwd=None: subprocess.run(["git", *a], cwd=cwd or self.root, capture_output=True, text=True, check=True)
+        self.git = g
+        self.remoto = Path(self.tmp.name + "-remoto.git")
+        g("init", "-q", "--bare", str(self.remoto), cwd="/")
+        g("init", "-q", "-b", "main")
+        g("config", "user.email", "teste@exemplo.invalid"); g("config", "user.name", "Teste")
+        g("remote", "add", "origin", str(self.remoto))
+        perfil = self.root / ".claude" / "memoria.yaml"
+        perfil.write_text(perfil.read_text().replace("commit_automatico: false", "commit_automatico: true")
+                          .replace("push: false", "push: true"))
+        g("add", "-A"); g("commit", "-q", "-m", "inicial"); g("push", "-q", "-u", "origin", "main")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.remoto, ignore_errors=True)
+        super().tearDown()
+
+    def fim(self):
+        return self.hook("hook-fim", {"hook_event_name": "Stop"})
+
+    def test_commita_e_envia_com_titulo_do_log(self):
+        self.escrever("runbooks/x.md", fm(type="Runbook", **BASE))
+        self.cli("log", "Criação", "runbook x — ver [x](/runbooks/x.md)")
+        self.assertEqual(self.fim().stdout.strip(), "")
+        titulo = self.git("log", "-1", "--format=%s").stdout.strip()
+        self.assertEqual(titulo, "memória: Criação: runbook x — ver x")
+        self.assertEqual(self.git("status", "--porcelain").stdout.strip(), "")
+        self.assertEqual(self.git("rev-parse", "HEAD").stdout, self.git("rev-parse", "main", cwd=str(self.remoto)).stdout)
+
+    def test_credencial_recusa_o_commit_inteiro(self):
+        antes = self.git("rev-parse", "HEAD").stdout
+        # fora do bundle (o lint não vê), mas dentro de git.caminhos: a varredura do commit tem de pegar
+        (self.root / "CLAUDE.md").write_text("acesso: curl -u elastic:Senha123 https://x\n")
+        out = json.loads(self.hook("hook-fim", {"hook_event_name": "Stop", "stop_hook_active": True}).stdout)
+        self.assertIn("RECUSADO", out.get("systemMessage", ""))
+        self.assertEqual(self.git("rev-parse", "HEAD").stdout, antes)
+
+    def test_erro_de_lint_nao_commita(self):
+        antes = self.git("rev-parse", "HEAD").stdout
+        (self.kb / "runbooks" / "ruim.md").write_text("# sem cabeçalho\n")
+        r = self.fim()
+        self.assertEqual(json.loads(r.stdout)["decision"], "block")
+        self.hook("hook-fim", {"hook_event_name": "Stop", "stop_hook_active": True})
+        self.assertEqual(self.git("rev-parse", "HEAD").stdout, antes)
+
+    def test_fora_dos_caminhos_nao_entra(self):
+        (self.root / "coleta-bruta.json").write_text('{"dado": 1}')
+        self.cli("log", "Descoberta", "algo")
+        self.fim()
+        self.assertIn("coleta-bruta.json", self.git("status", "--porcelain").stdout)
+        self.assertNotIn("coleta-bruta.json", self.git("show", "--name-only", "--format=").stdout)
+
+    def test_desligado_nao_commita(self):
+        perfil = self.root / ".claude" / "memoria.yaml"
+        perfil.write_text(perfil.read_text().replace("commit_automatico: true", "commit_automatico: false"))
+        antes = self.git("rev-parse", "HEAD").stdout
+        self.cli("log", "Descoberta", "algo")
+        self.fim()
+        self.assertEqual(self.git("rev-parse", "HEAD").stdout, antes)
+
+
 if __name__ == "__main__":
     unittest.main()
